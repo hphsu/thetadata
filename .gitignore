@@ -1,0 +1,40 @@
+# Credentials - NEVER commit
+creds.txt
+*.env
+.env*
+
+# ThetaTerminal binary (large file)
+ThetaTerminalv3.jar
+*.jar
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Serena project files
+.serena/
+
+# Data files (too large)
+data/
+*.parquet
+*.csv
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
