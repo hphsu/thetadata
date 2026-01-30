@@ -243,30 +243,32 @@ class SPXDownloader:
 
         total_rows = 0
         completed = 0
+        batch_size = 10  # Process in batches to avoid OOM
 
-        # Use ThreadPoolExecutor for parallel downloads
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all download tasks
-            future_to_exp = {
-                executor.submit(self.download_expiration, symbol, exp): exp
-                for exp in past_exps
-            }
+        # Process in batches to control memory usage
+        for batch_start in range(0, len(past_exps), batch_size):
+            batch = past_exps[batch_start:batch_start + batch_size]
 
-            # Process completed downloads as they finish
-            for future in as_completed(future_to_exp):
-                expiration = future_to_exp[future]
-                completed += 1
-                try:
-                    rows = future.result()
-                    total_rows += rows
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_exp = {
+                    executor.submit(self.download_expiration, symbol, exp): exp
+                    for exp in batch
+                }
 
-                    if completed % 10 == 0 or rows > 0:
-                        elapsed = time.time() - self.start_time
-                        rate = self.total_requests / elapsed * 60 if elapsed > 0 else 0
-                        logger.info(f"    [{completed}/{len(past_exps)}] {symbol} {expiration}: {rows:,} rows ({rate:.0f} req/min)")
+                for future in as_completed(future_to_exp):
+                    expiration = future_to_exp[future]
+                    completed += 1
+                    try:
+                        rows = future.result()
+                        total_rows += rows
 
-                except Exception as e:
-                    logger.error(f"    Error {symbol} {expiration}: {e}")
+                        if completed % 10 == 0 or rows > 0:
+                            elapsed = time.time() - self.start_time
+                            rate = self.total_requests / elapsed * 60 if elapsed > 0 else 0
+                            logger.info(f"    [{completed}/{len(past_exps)}] {symbol} {expiration}: {rows:,} rows ({rate:.0f} req/min)")
+
+                    except Exception as e:
+                        logger.error(f"    Error {symbol} {expiration}: {e}")
 
         return total_rows
 
