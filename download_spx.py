@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import time
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import psutil
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -39,9 +42,15 @@ class SPXDownloader:
         self.request_delay = 0.25  # 4 requests/second max
         self.last_request_time = 0
         self.interval = interval
+        self.max_workers = 2  # VALUE tier allows 2 concurrent requests
+        self.max_memory_percent = 80  # Pause if memory exceeds this %
 
         # SPX symbols (weekly is the main one)
         self.symbols = ["SPXW", "SPXQ", "SPXPM"]
+
+        # Thread-safe lock for progress updates
+        self._progress_lock = threading.Lock()
+        self._throttle_lock = threading.Lock()
 
         # Data directory
         self.data_dir = self.config.data_dir / "spx" / interval
@@ -67,17 +76,25 @@ class SPXDownloader:
         return {"completed_expirations": {}, "last_update": None}
 
     def _save_progress(self):
-        """Save download progress"""
-        self.progress["last_update"] = datetime.now().isoformat()
-        with open(self.progress_file, 'w') as f:
-            json.dump(self.progress, f, indent=2)
+        """Save download progress (thread-safe)"""
+        with self._progress_lock:
+            self.progress["last_update"] = datetime.now().isoformat()
+            with open(self.progress_file, 'w') as f:
+                json.dump(self.progress, f, indent=2)
 
     def _throttle(self):
-        """Rate limit requests"""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.request_delay:
-            time.sleep(self.request_delay - elapsed)
-        self.last_request_time = time.time()
+        """Rate limit requests (thread-safe)"""
+        with self._throttle_lock:
+            elapsed = time.time() - self.last_request_time
+            if elapsed < self.request_delay:
+                time.sleep(self.request_delay - elapsed)
+            self.last_request_time = time.time()
+
+    def _wait_for_memory(self):
+        """Wait if memory usage is too high"""
+        while psutil.virtual_memory().percent > self.max_memory_percent:
+            logger.debug(f"Memory at {psutil.virtual_memory().percent}%, waiting...")
+            time.sleep(1)
 
     def get_expirations(self, symbol: str) -> Optional[List[str]]:
         """Get all available expirations for a symbol"""
@@ -177,10 +194,14 @@ class SPXDownloader:
 
     def download_expiration(self, symbol: str, expiration: str) -> int:
         """Download all data for a single expiration using streaming writes"""
-        # Check if already completed
+        # Check if already completed (thread-safe)
         exp_key = f"{symbol}_{expiration}"
-        if exp_key in self.progress.get("completed_expirations", {}):
-            return self.progress["completed_expirations"][exp_key]
+        with self._progress_lock:
+            if exp_key in self.progress.get("completed_expirations", {}):
+                return self.progress["completed_expirations"][exp_key]
+
+        # Wait if memory is too high before starting
+        self._wait_for_memory()
 
         # Get months to download
         months = self.get_months_for_expiration(expiration)
@@ -221,15 +242,16 @@ class SPXDownloader:
                 writer.close()
 
         if total_rows > 0:
-            # Mark as completed
-            self.progress.setdefault("completed_expirations", {})[exp_key] = total_rows
+            # Mark as completed (thread-safe)
+            with self._progress_lock:
+                self.progress.setdefault("completed_expirations", {})[exp_key] = total_rows
             self._save_progress()
             return total_rows
 
         return 0
 
     def download_symbol(self, symbol: str, year_start: int = None, year_end: int = None) -> int:
-        """Download all expirations for a symbol"""
+        """Download all expirations for a symbol using memory-aware parallel workers"""
         logger.info(f"Processing {symbol}...")
 
         expirations = self.get_expirations(symbol)
@@ -248,20 +270,58 @@ class SPXDownloader:
         past_exps = [e for e in expirations if e <= today]
 
         logger.info(f"  {len(past_exps)} historical expirations to download")
+        logger.info(f"  Using {self.max_workers} workers (memory limit: {self.max_memory_percent}%)")
 
         total_rows = 0
-        for i, expiration in enumerate(past_exps, 1):
-            try:
-                rows = self.download_expiration(symbol, expiration)
-                total_rows += rows
+        completed = 0
+        pending_futures = {}
 
-                if i % 10 == 0 or rows > 0:
-                    elapsed = time.time() - self.start_time
-                    rate = self.total_requests / elapsed * 60 if elapsed > 0 else 0
-                    logger.info(f"    [{i}/{len(past_exps)}] {symbol} {expiration}: {rows:,} rows ({rate:.0f} req/min)")
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            exp_iter = iter(past_exps)
+            finished = False
 
-            except Exception as e:
-                logger.error(f"    Error {symbol} {expiration}: {e}")
+            while not finished or pending_futures:
+                # Submit new tasks if under memory limit and have capacity
+                while not finished and len(pending_futures) < self.max_workers:
+                    mem = psutil.virtual_memory().percent
+                    if mem > self.max_memory_percent:
+                        logger.debug(f"Memory at {mem}%, waiting...")
+                        break  # Don't start new tasks if memory is high
+
+                    try:
+                        exp = next(exp_iter)
+                        future = executor.submit(self.download_expiration, symbol, exp)
+                        pending_futures[future] = exp
+                    except StopIteration:
+                        finished = True
+                        break
+
+                # Wait for at least one task to complete
+                if pending_futures:
+                    done_futures = []
+                    for future in list(pending_futures.keys()):
+                        if future.done():
+                            done_futures.append(future)
+
+                    if not done_futures:
+                        time.sleep(0.1)  # Brief wait if nothing done yet
+                        continue
+
+                    for future in done_futures:
+                        expiration = pending_futures.pop(future)
+                        completed += 1
+                        try:
+                            rows = future.result()
+                            total_rows += rows
+
+                            if completed % 10 == 0 or rows > 0:
+                                elapsed = time.time() - self.start_time
+                                rate = self.total_requests / elapsed * 60 if elapsed > 0 else 0
+                                mem = psutil.virtual_memory().percent
+                                logger.info(f"    [{completed}/{len(past_exps)}] {symbol} {expiration}: {rows:,} rows ({rate:.0f} req/min, mem:{mem:.0f}%)")
+
+                        except Exception as e:
+                            logger.error(f"    Error {symbol} {expiration}: {e}")
 
         return total_rows
 
