@@ -269,6 +269,76 @@ class SPXDownloader:
 
         return total_exps
 
+    def status(self, year_start: int = None):
+        """Check download status - compare available vs downloaded"""
+        logger.info("=" * 70)
+        logger.info("SPX DOWNLOAD STATUS")
+        logger.info("=" * 70)
+
+        today = datetime.now().strftime("%Y%m%d")
+        total_available = 0
+        total_downloaded = 0
+        total_missing = 0
+        all_missing = []
+
+        for symbol in self.symbols:
+            # Get available from API
+            exps = self.get_expirations(symbol)
+            if not exps:
+                continue
+
+            available = set(e for e in exps if e <= today)
+            if year_start:
+                available = set(e for e in available if int(e[:4]) >= year_start)
+
+            # Get downloaded files
+            downloaded = set(f.stem.split('_')[1] for f in self.data_dir.glob(f"{symbol}_*.parquet"))
+
+            missing = sorted(available - downloaded)
+
+            logger.info(f"\n{symbol}:")
+            logger.info(f"  Available: {len(available)}")
+            logger.info(f"  Downloaded: {len(downloaded)}")
+            logger.info(f"  Missing: {len(missing)}")
+
+            if missing:
+                all_missing.extend([(symbol, e) for e in missing])
+
+            total_available += len(available)
+            total_downloaded += len(downloaded)
+            total_missing += len(missing)
+
+        # Summary
+        logger.info("\n" + "=" * 70)
+        logger.info("SUMMARY")
+        logger.info("=" * 70)
+        logger.info(f"Total available: {total_available}")
+        logger.info(f"Total downloaded: {total_downloaded}")
+        logger.info(f"Total missing: {total_missing}")
+
+        if total_available > 0:
+            pct = (total_downloaded / total_available) * 100
+            logger.info(f"Progress: {pct:.1f}%")
+
+        # Storage info
+        total_size = 0
+        file_count = 0
+        for f in self.data_dir.glob("*.parquet"):
+            total_size += f.stat().st_size / (1024 * 1024)
+            file_count += 1
+        logger.info(f"Files on disk: {file_count}")
+        logger.info(f"Storage used: {total_size:.1f} MB")
+
+        # Show first few missing
+        if all_missing:
+            logger.info(f"\nFirst 10 missing expirations:")
+            for symbol, exp in all_missing[:10]:
+                logger.info(f"  {symbol} {exp}")
+            if len(all_missing) > 10:
+                logger.info(f"  ... and {len(all_missing) - 10} more")
+
+        return total_missing
+
     def run(self, symbols: List[str] = None, year_start: int = None, year_end: int = None):
         """Download all SPX data"""
         if symbols is None:
@@ -330,11 +400,14 @@ def main():
     parser.add_argument("--year-start", type=int, default=None, help="Start year (default: all)")
     parser.add_argument("--year-end", type=int, default=None, help="End year (default: all)")
     parser.add_argument("--estimate-only", action="store_true", help="Only show estimates, don't download")
+    parser.add_argument("--status", action="store_true", help="Show download status (available vs downloaded)")
     args = parser.parse_args()
 
     downloader = SPXDownloader(interval=args.interval)
 
-    if args.estimate_only:
+    if args.status:
+        downloader.status(year_start=args.year_start)
+    elif args.estimate_only:
         downloader.estimate_download()
     else:
         downloader.run(
