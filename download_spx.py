@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import time
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
 
@@ -37,9 +39,13 @@ class SPXDownloader:
         self.request_delay = 0.25  # 4 requests/second max
         self.last_request_time = 0
         self.interval = interval
+        self.max_workers = 2  # VALUE tier allows 2 concurrent requests
 
         # SPX symbols (weekly is the main one)
         self.symbols = ["SPXW", "SPXQ", "SPXPM"]
+
+        # Thread-safe lock for progress updates
+        self._progress_lock = threading.Lock()
 
         # Data directory
         self.data_dir = self.config.data_dir / "spx" / interval
@@ -65,10 +71,11 @@ class SPXDownloader:
         return {"completed_expirations": {}, "last_update": None}
 
     def _save_progress(self):
-        """Save download progress"""
-        self.progress["last_update"] = datetime.now().isoformat()
-        with open(self.progress_file, 'w') as f:
-            json.dump(self.progress, f, indent=2)
+        """Save download progress (thread-safe)"""
+        with self._progress_lock:
+            self.progress["last_update"] = datetime.now().isoformat()
+            with open(self.progress_file, 'w') as f:
+                json.dump(self.progress, f, indent=2)
 
     def _throttle(self):
         """Rate limit requests"""
@@ -175,10 +182,11 @@ class SPXDownloader:
 
     def download_expiration(self, symbol: str, expiration: str) -> int:
         """Download all data for a single expiration"""
-        # Check if already completed
+        # Check if already completed (thread-safe read)
         exp_key = f"{symbol}_{expiration}"
-        if exp_key in self.progress.get("completed_expirations", {}):
-            return self.progress["completed_expirations"][exp_key]
+        with self._progress_lock:
+            if exp_key in self.progress.get("completed_expirations", {}):
+                return self.progress["completed_expirations"][exp_key]
 
         # Get months to download
         months = self.get_months_for_expiration(expiration)
@@ -198,8 +206,9 @@ class SPXDownloader:
             filepath = self.data_dir / f"{symbol}_{expiration}.parquet"
             df.to_parquet(filepath, compression='snappy', index=False)
 
-            # Mark as completed
-            self.progress.setdefault("completed_expirations", {})[exp_key] = len(df)
+            # Mark as completed (thread-safe)
+            with self._progress_lock:
+                self.progress.setdefault("completed_expirations", {})[exp_key] = len(df)
             self._save_progress()
 
             return len(df)
@@ -207,7 +216,7 @@ class SPXDownloader:
         return 0
 
     def download_symbol(self, symbol: str, year_start: int = None, year_end: int = None) -> int:
-        """Download all expirations for a symbol"""
+        """Download all expirations for a symbol using parallel requests"""
         logger.info(f"Processing {symbol}...")
 
         expirations = self.get_expirations(symbol)
@@ -226,20 +235,34 @@ class SPXDownloader:
         past_exps = [e for e in expirations if e <= today]
 
         logger.info(f"  {len(past_exps)} historical expirations to download")
+        logger.info(f"  Using {self.max_workers} parallel workers")
 
         total_rows = 0
-        for i, expiration in enumerate(past_exps, 1):
-            try:
-                rows = self.download_expiration(symbol, expiration)
-                total_rows += rows
+        completed = 0
 
-                if i % 10 == 0 or rows > 0:
-                    elapsed = time.time() - self.start_time
-                    rate = self.total_requests / elapsed * 60 if elapsed > 0 else 0
-                    logger.info(f"    [{i}/{len(past_exps)}] {symbol} {expiration}: {rows:,} rows ({rate:.0f} req/min)")
+        # Use ThreadPoolExecutor for parallel downloads
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all download tasks
+            future_to_exp = {
+                executor.submit(self.download_expiration, symbol, exp): exp
+                for exp in past_exps
+            }
 
-            except Exception as e:
-                logger.error(f"    Error {symbol} {expiration}: {e}")
+            # Process completed downloads as they finish
+            for future in as_completed(future_to_exp):
+                expiration = future_to_exp[future]
+                completed += 1
+                try:
+                    rows = future.result()
+                    total_rows += rows
+
+                    if completed % 10 == 0 or rows > 0:
+                        elapsed = time.time() - self.start_time
+                        rate = self.total_requests / elapsed * 60 if elapsed > 0 else 0
+                        logger.info(f"    [{completed}/{len(past_exps)}] {symbol} {expiration}: {rows:,} rows ({rate:.0f} req/min)")
+
+                except Exception as e:
+                    logger.error(f"    Error {symbol} {expiration}: {e}")
 
         return total_rows
 
@@ -401,9 +424,11 @@ def main():
     parser.add_argument("--year-end", type=int, default=None, help="End year (default: all)")
     parser.add_argument("--estimate-only", action="store_true", help="Only show estimates, don't download")
     parser.add_argument("--status", action="store_true", help="Show download status (available vs downloaded)")
+    parser.add_argument("--workers", type=int, default=2, help="Number of parallel workers (default: 2, VALUE tier max)")
     args = parser.parse_args()
 
     downloader = SPXDownloader(interval=args.interval)
+    downloader.max_workers = args.workers
 
     if args.status:
         downloader.status(year_start=args.year_start)
