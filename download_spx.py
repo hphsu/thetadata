@@ -47,6 +47,9 @@ class SPXDownloader:
         # Thread-safe lock for progress updates
         self._progress_lock = threading.Lock()
 
+        # Thread-local storage for per-thread throttling
+        self._thread_local = threading.local()
+
         # Data directory
         self.data_dir = self.config.data_dir / "spx" / interval
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -78,11 +81,12 @@ class SPXDownloader:
                 json.dump(self.progress, f, indent=2)
 
     def _throttle(self):
-        """Rate limit requests"""
-        elapsed = time.time() - self.last_request_time
+        """Rate limit requests (per-thread to allow parallel execution)"""
+        last_time = getattr(self._thread_local, 'last_request_time', 0)
+        elapsed = time.time() - last_time
         if elapsed < self.request_delay:
             time.sleep(self.request_delay - elapsed)
-        self.last_request_time = time.time()
+        self._thread_local.last_request_time = time.time()
 
     def get_expirations(self, symbol: str) -> Optional[List[str]]:
         """Get all available expirations for a symbol"""
