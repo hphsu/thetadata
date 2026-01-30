@@ -42,7 +42,7 @@ class SPXDownloader:
         self.request_delay = 0.25  # 4 requests/second max
         self.last_request_time = 0
         self.interval = interval
-        self.max_workers = 2  # VALUE tier allows 2 concurrent requests
+        self.max_workers = 3  # VALUE tier has 1 server thread, 3 overlaps latency well
         self.max_memory_percent = 80  # Pause if memory exceeds this %
 
         # SPX symbols (weekly is the main one)
