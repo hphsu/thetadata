@@ -10,6 +10,8 @@ from typing import Dict, List, Optional
 import time
 import json
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import requests
 
 from config import Config
@@ -174,7 +176,7 @@ class SPXDownloader:
         return months
 
     def download_expiration(self, symbol: str, expiration: str) -> int:
-        """Download all data for a single expiration"""
+        """Download all data for a single expiration using streaming writes"""
         # Check if already completed
         exp_key = f"{symbol}_{expiration}"
         if exp_key in self.progress.get("completed_expirations", {}):
@@ -182,27 +184,47 @@ class SPXDownloader:
 
         # Get months to download
         months = self.get_months_for_expiration(expiration)
+        filepath = self.data_dir / f"{symbol}_{expiration}.parquet"
 
-        all_data = []
-        for month_start, month_end in months:
-            data = self.get_ohlc_data(symbol, expiration, month_start, month_end)
-            if data:
-                all_data.extend(data)
+        total_rows = 0
+        writer = None
+        download_time = datetime.now().isoformat()
 
-        if all_data:
-            # Save to parquet (one file per expiration)
-            df = pd.DataFrame(all_data)
-            df["underlying"] = "SPX"
-            df["download_time"] = datetime.now().isoformat()
+        try:
+            for month_start, month_end in months:
+                data = self.get_ohlc_data(symbol, expiration, month_start, month_end)
+                if not data:
+                    continue
 
-            filepath = self.data_dir / f"{symbol}_{expiration}.parquet"
-            df.to_parquet(filepath, compression='snappy', index=False)
+                # Add metadata columns
+                for row in data:
+                    row["underlying"] = "SPX"
+                    row["download_time"] = download_time
 
+                # Convert to PyArrow table (much more memory efficient than pandas)
+                table = pa.Table.from_pylist(data)
+
+                # Initialize writer with schema from first batch
+                if writer is None:
+                    writer = pq.ParquetWriter(filepath, table.schema, compression='snappy')
+
+                # Write immediately to disk - memory freed after this
+                writer.write_table(table)
+                total_rows += len(data)
+
+                # Explicitly free memory
+                del data
+                del table
+
+        finally:
+            if writer:
+                writer.close()
+
+        if total_rows > 0:
             # Mark as completed
-            self.progress.setdefault("completed_expirations", {})[exp_key] = len(df)
+            self.progress.setdefault("completed_expirations", {})[exp_key] = total_rows
             self._save_progress()
-
-            return len(df)
+            return total_rows
 
         return 0
 
