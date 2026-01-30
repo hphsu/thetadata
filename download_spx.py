@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import time
 import json
+import gc
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
@@ -208,14 +209,19 @@ class SPXDownloader:
             df["download_time"] = datetime.now().isoformat()
 
             filepath = self.data_dir / f"{symbol}_{expiration}.parquet"
+            row_count = len(df)
             df.to_parquet(filepath, compression='snappy', index=False)
+
+            # Free memory immediately
+            del df
+            del all_data
 
             # Mark as completed (thread-safe)
             with self._progress_lock:
-                self.progress.setdefault("completed_expirations", {})[exp_key] = len(df)
+                self.progress.setdefault("completed_expirations", {})[exp_key] = row_count
             self._save_progress()
 
-            return len(df)
+            return row_count
 
         return 0
 
@@ -243,32 +249,25 @@ class SPXDownloader:
 
         total_rows = 0
         completed = 0
-        batch_size = 10  # Process in batches to avoid OOM
 
-        # Process in batches to control memory usage
-        for batch_start in range(0, len(past_exps), batch_size):
-            batch = past_exps[batch_start:batch_start + batch_size]
+        # Sequential processing with explicit GC to control memory
+        for i, expiration in enumerate(past_exps, 1):
+            try:
+                rows = self.download_expiration(symbol, expiration)
+                total_rows += rows
+                completed += 1
 
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_exp = {
-                    executor.submit(self.download_expiration, symbol, exp): exp
-                    for exp in batch
-                }
+                if completed % 10 == 0 or rows > 0:
+                    elapsed = time.time() - self.start_time
+                    rate = self.total_requests / elapsed * 60 if elapsed > 0 else 0
+                    logger.info(f"    [{completed}/{len(past_exps)}] {symbol} {expiration}: {rows:,} rows ({rate:.0f} req/min)")
 
-                for future in as_completed(future_to_exp):
-                    expiration = future_to_exp[future]
-                    completed += 1
-                    try:
-                        rows = future.result()
-                        total_rows += rows
+                # Force garbage collection every 5 expirations to control memory
+                if i % 5 == 0:
+                    gc.collect()
 
-                        if completed % 10 == 0 or rows > 0:
-                            elapsed = time.time() - self.start_time
-                            rate = self.total_requests / elapsed * 60 if elapsed > 0 else 0
-                            logger.info(f"    [{completed}/{len(past_exps)}] {symbol} {expiration}: {rows:,} rows ({rate:.0f} req/min)")
-
-                    except Exception as e:
-                        logger.error(f"    Error {symbol} {expiration}: {e}")
+            except Exception as e:
+                logger.error(f"    Error {symbol} {expiration}: {e}")
 
         return total_rows
 
